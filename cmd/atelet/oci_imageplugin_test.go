@@ -149,7 +149,7 @@ func TestPluginLameDuckDrain_FallsBackToImageCacheAndReleasesActiveLeases(t *tes
 
 	// Step 1: Prepare bundle while plugin is serving normally.
 	actor1 := "actor-streamed"
-	if _, err := prepareOCIDirectory(ctx, store, atelet.imagePluginClient, nil, nil, actor1, "app", ref, nil, nil); err != nil {
+	if _, _, err := prepareOCIDirectory(ctx, store, atelet.imagePluginClient, nil, nil, actor1, "app", ref, nil, nil); err != nil {
 		t.Fatalf("prepareOCIDirectory(streamed) failed: %v", err)
 	}
 	spec1, err := imagecache.ReadSpec(ateletpath.OCIBundlePath(actor1, "app"))
@@ -166,7 +166,7 @@ func TestPluginLameDuckDrain_FallsBackToImageCacheAndReleasesActiveLeases(t *tes
 
 	// New or resuming actors immediately fall back to local imageCache.
 	actor2 := "actor-drained"
-	if _, err := prepareOCIDirectory(ctx, store, atelet.imagePluginClient, nil, nil, actor2, "app", ref, nil, nil); err != nil {
+	if _, _, err := prepareOCIDirectory(ctx, store, atelet.imagePluginClient, nil, nil, actor2, "app", ref, nil, nil); err != nil {
 		t.Fatalf("prepareOCIDirectory(drained) failed: %v", err)
 	}
 	spec2, err := imagecache.ReadSpec(ateletpath.OCIBundlePath(actor2, "app"))
