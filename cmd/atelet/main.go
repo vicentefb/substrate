@@ -842,6 +842,9 @@ func (s *Atelet) lockActor(ctx context.Context, actorUID string) (func(), error)
 }
 
 // NewService creates a new WorkersManagerService.
+// maxSlotWait bounds how long an RPC waits for one of the node's slots.
+const maxSlotWait = 15 * time.Second
+
 // newSlots returns a semaphore of n slots, or nil for no bound.
 func newSlots(n int) *semaphore.Weighted {
 	if n <= 0 {
@@ -857,9 +860,13 @@ func acquireSlot(ctx context.Context, slots *semaphore.Weighted, op string) (fun
 	if slots == nil {
 		return func() {}, nil
 	}
+	// A bounded wait: past it the caller hears Unavailable while its own
+	// deadline still has room, retries, and the actor stays on this node.
+	waitCtx, cancel := context.WithTimeout(ctx, maxSlotWait)
+	defer cancel()
 	t := time.Now()
-	if err := slots.Acquire(ctx, 1); err != nil {
-		return nil, status.Errorf(codes.Unavailable, "waiting for a %s slot on this node: %v", op, err)
+	if err := slots.Acquire(waitCtx, 1); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "this node has no free %s slot after %s: %v", op, maxSlotWait, err)
 	}
 	if wait := time.Since(t); wait > time.Second {
 		slog.InfoContext(ctx, "Waited for a node slot", slog.String("op", op), slog.Duration("wait", wait))

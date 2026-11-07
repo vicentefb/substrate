@@ -39,6 +39,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
+// inFlightResumeAge is how recently a RESUMING actor must have been written
+// for a routed resume to treat the resume as in flight and not take the
+// lease; it matches the lease TTL, after which a dead driver's lease lapses.
+const inFlightResumeAge = 30 * time.Second
+
 // restoreTelemetry labels the restore operation for the resume lifecycle
 // metric. WireFidelity describes the restore requested, not the stored
 // snapshot's scope: a MEMORY snapshot restored under a replaced template goes
@@ -81,6 +86,16 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	}
 	if wasRunning = actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING; wasRunning {
 		return actor, false, nil
+	}
+	// A resume already in flight holds the lease. Routed requests arrive
+	// many times a second while a sandbox comes up; answering them here keeps
+	// each from taking and losing a lease row, which was half of the store's
+	// time under load. The caller retries, as it does for a lost lease. A
+	// RESUMING actor not written to for longer than a lease lasts has lost
+	// its driver and goes on to take the lease and be driven again.
+	if actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RESUMING &&
+		time.Since(actor.GetMetadata().GetUpdateTime().AsTime()) < inFlightResumeAge {
+		return nil, false, apierror.Aborted("another operation is in progress for this actor")
 	}
 
 	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
@@ -811,7 +826,22 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 		EgressGateway:  egressGateway,
 		Resources:      actorResources,
 	}
-	resp, err := client.Restore(ctx, req)
+	// atelet answers Unavailable when the node is busy (its restore lane is
+	// full) or saturated; the actor stays bound to its node, so a few retries
+	// here keep a waiting wake where its snapshot is instead of failing it.
+	var resp *ateletpb.RestoreResponse
+	for attempt, wait := 1, 2*time.Second; ; attempt, wait = attempt+1, wait*2 {
+		resp, err = client.Restore(ctx, req)
+		if err == nil || ctx.Err() != nil || status.Code(err) != codes.Unavailable || attempt >= 4 {
+			break
+		}
+		slog.WarnContext(ctx, "atelet Restore unavailable; retrying on the same node",
+			slog.Any("actor", actorRef), slog.Int("attempt", attempt), slog.Any("err", err))
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
 	if err != nil {
 		// The snapshot's node is gone, and atelet found no upload of it.
 		if ctx.Err() == nil && status.Code(err) == codes.NotFound && localElsewhere(snap, assignment.GetNodeName()) {
