@@ -382,7 +382,9 @@ func ensureContainerImage(ctx context.Context, imageCache *imagecache.Store, lay
 			ImageRef:   ref,
 			AuthConfig: resolveAuthConfigForRef(ref, keychain),
 		}
+		tCan := time.Now()
 		canProvide, err := layerClient.CanProvide(ctx, req)
+		dCan := time.Since(tCan)
 		if err != nil {
 			instruments.RecordImagePlugin(ctx, layerClient.Name(), ateattr.ImagePluginOutcomeFallback, time.Since(t0))
 			slog.WarnContext(ctx, "Error evaluating ImagePlugin eligibility; falling back to cache",
@@ -395,7 +397,9 @@ func ensureContainerImage(ctx context.Context, imageCache *imagecache.Store, lay
 				slog.String("image", ref),
 				slog.String("provider", layerClient.Name()))
 		} else {
+			tPrep := time.Now()
 			res, err := layerClient.PrepareImage(ctx, req)
+			dPrep := time.Since(tPrep)
 			provider := layerClient.Name()
 			if res != nil && res.ProviderName != "" {
 				provider = res.ProviderName
@@ -418,10 +422,13 @@ func ensureContainerImage(ctx context.Context, imageCache *imagecache.Store, lay
 				if res.ImageDigest != "" {
 					digest, _ = v1.NewHash(res.ImageDigest)
 				}
+				var dConfig time.Duration
 				if res.Config != nil {
 					cfg = *res.Config
 				} else {
+					tCfg := time.Now()
 					d, c, err := fetchImageConfig(ctx, ref, keychain)
+					dConfig = time.Since(tCfg)
 					if err != nil {
 						_ = layerClient.ReleaseImage(ctx, &imagepluginclient.ReleaseRequest{ImageRef: ref})
 						instruments.RecordImagePlugin(ctx, provider, ateattr.ImagePluginOutcomeFallback, time.Since(t0))
@@ -436,11 +443,16 @@ func ensureContainerImage(ctx context.Context, imageCache *imagecache.Store, lay
 					cfg = c
 				}
 				instruments.RecordImagePlugin(ctx, provider, ateattr.ImagePluginOutcomeSuccess, time.Since(t0))
-				slog.DebugContext(ctx, "Image streamed via ImagePlugin",
+				// Info, with the split, so the time an image spends in this path
+				// under load can be read off the node's log.
+				slog.InfoContext(ctx, "Image streamed via ImagePlugin",
 					slog.String("image", ref),
 					slog.String("provider", provider),
 					slog.Int("layers", len(res.LayerDirs)),
-					slog.Duration("duration", time.Since(t0)))
+					slog.Duration("duration", time.Since(t0)),
+					slog.Duration("can_provide", dCan),
+					slog.Duration("prepare", dPrep),
+					slog.Duration("config", dConfig))
 				return &imagecache.Image{
 					Digest:    digest,
 					Config:    cfg,

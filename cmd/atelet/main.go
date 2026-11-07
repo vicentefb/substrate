@@ -69,6 +69,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -121,6 +122,8 @@ var (
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 	imagePluginSocket            = pflag.String("image-plugin-socket", imagepluginclient.DefaultSocketPath, "Unix socket of the out-of-process image plugin daemon. Automatically detected when present on the node; empty disables image streaming and falls back to the local image cache.")
+	maxConcurrentRestores        = pflag.Int("max-concurrent-restores", 0, "Most Restore RPCs this atelet runs at once; the rest wait their turn. 0 means no limit.")
+	maxConcurrentCheckpoints     = pflag.Int("max-concurrent-checkpoints", 0, "Most Checkpoint RPCs this atelet runs at once; the rest wait their turn. 0 means no limit.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
@@ -679,6 +682,9 @@ func validateSnapshotDelayFlags() error {
 // --snapshot-detach-workers, and --snapshot-report-workers: each must be at
 // least 1.
 func validateSnapshotWorkerFlags() error {
+	if *maxConcurrentRestores < 0 || *maxConcurrentCheckpoints < 0 {
+		return fmt.Errorf("--max-concurrent-restores %d and --max-concurrent-checkpoints %d must be >= 0", *maxConcurrentRestores, *maxConcurrentCheckpoints)
+	}
 	if *snapshotUploadWorkers < 1 {
 		return fmt.Errorf("--snapshot-upload-workers %d must be >= 1", *snapshotUploadWorkers)
 	}
@@ -753,6 +759,10 @@ type Atelet struct {
 	workerDialer          *WorkerDialer
 	imageCache            *imagecache.Store
 	imagePluginClient     imagepluginclient.Client
+	// restoreSlots and checkpointSlots bound how many Restore and Checkpoint
+	// RPCs run at once on this node; nil means no bound.
+	restoreSlots    *semaphore.Weighted
+	checkpointSlots *semaphore.Weighted
 	imageKeychain         authn.Keychain
 	evictedStreamedMu     sync.Mutex
 	evictedStreamedActors map[string]bool
@@ -827,6 +837,31 @@ func (s *Atelet) lockActor(ctx context.Context, actorUID string) (func(), error)
 }
 
 // NewService creates a new WorkersManagerService.
+// newSlots returns a semaphore of n slots, or nil for no bound.
+func newSlots(n int) *semaphore.Weighted {
+	if n <= 0 {
+		return nil
+	}
+	return semaphore.NewWeighted(int64(n))
+}
+
+// acquireSlot takes one of the node's slots for op, waiting as long as ctx
+// allows, and returns the release. A nil slots means no bound. Waits over a
+// second are logged: they are the queue the bound creates.
+func acquireSlot(ctx context.Context, slots *semaphore.Weighted, op string) (func(), error) {
+	if slots == nil {
+		return func() {}, nil
+	}
+	t := time.Now()
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "waiting for a %s slot on this node: %v", op, err)
+	}
+	if wait := time.Since(t); wait > time.Second {
+		slog.InfoContext(ctx, "Waited for a node slot", slog.String("op", op), slog.Duration("wait", wait))
+	}
+	return func() { slots.Release(1) }, nil
+}
+
 func NewService(
 	ctx context.Context,
 	workerDialer *WorkerDialer,
@@ -851,6 +886,8 @@ func NewService(
 	wms := &Atelet{
 		workerDialer:          workerDialer,
 		imageCache:            imageCache,
+		restoreSlots:          newSlots(*maxConcurrentRestores),
+		checkpointSlots:       newSlots(*maxConcurrentCheckpoints),
 		sandboxAssetCache:     sandboxAssetCache,
 		snapshotCache:         snapshotCache,
 		runtimes:              runtimes,
@@ -1028,6 +1065,11 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	if errs := apivalidation.ValidateCheckpointRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
+	releaseSlot, err := acquireSlot(ctx, s.checkpointSlots, "Checkpoint")
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
@@ -1752,6 +1794,11 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if errs := apivalidation.ValidateRestoreRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
+	releaseSlot, err := acquireSlot(ctx, s.restoreSlots, "Restore")
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	actorUID := req.GetActorUid()
 	actor := actorRef{atespace: req.GetAtespace(), name: req.GetActorName(), uid: actorUID}

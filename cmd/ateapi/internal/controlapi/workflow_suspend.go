@@ -262,7 +262,23 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 	}
 	wireFidelity = ateattr.SnapshotFidelityValue(fidelity)
 
-	resp, err := client.Checkpoint(ctx, req)
+	// An atelet saturated by its actors fails the TLS handshake or the call
+	// with Unavailable while the actor is still running, so a few retries
+	// save the suspend. Checkpoint tolerates retries: one that committed its
+	// snapshot answers from it.
+	var resp *ateletpb.CheckpointResponse
+	for attempt, wait := 1, time.Second; ; attempt, wait = attempt+1, wait*2 {
+		resp, err = client.Checkpoint(ctx, req)
+		if err == nil || ctx.Err() != nil || status.Code(err) != codes.Unavailable || attempt >= 4 {
+			break
+		}
+		slog.WarnContext(ctx, "atelet Checkpoint unavailable; retrying",
+			slog.Any("actor", actorRef), slog.Int("attempt", attempt), slog.Any("err", err))
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
 	if err != nil {
 		// A snapshot conflict leaves the actor and its assignment intact for a retry.
 		if ctx.Err() == nil && status.Code(err) == codes.Aborted {
