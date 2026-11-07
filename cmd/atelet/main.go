@@ -122,7 +122,8 @@ var (
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 	imagePluginSocket            = pflag.String("image-plugin-socket", imagepluginclient.DefaultSocketPath, "Unix socket of the out-of-process image plugin daemon. Automatically detected when present on the node; empty disables image streaming and falls back to the local image cache.")
-	maxConcurrentRestores        = pflag.Int("max-concurrent-restores", 0, "Most Restore RPCs this atelet runs at once; the rest wait their turn. 0 means no limit.")
+	maxConcurrentImagePreps      = pflag.Int("max-concurrent-image-preps", 0, "Most images this atelet prepares at once for actors whose image is not yet on the node (a pull and unpack, or a streamed mount); the rest wait their turn. 0 means no limit.")
+	maxConcurrentRestores        = pflag.Int("max-concurrent-restores", 0, "Most worker restores this atelet runs at once; the rest wait their turn. 0 means no limit.")
 	maxConcurrentCheckpoints     = pflag.Int("max-concurrent-checkpoints", 0, "Most Checkpoint RPCs this atelet runs at once; the rest wait their turn. 0 means no limit.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
@@ -682,8 +683,8 @@ func validateSnapshotDelayFlags() error {
 // --snapshot-detach-workers, and --snapshot-report-workers: each must be at
 // least 1.
 func validateSnapshotWorkerFlags() error {
-	if *maxConcurrentRestores < 0 || *maxConcurrentCheckpoints < 0 {
-		return fmt.Errorf("--max-concurrent-restores %d and --max-concurrent-checkpoints %d must be >= 0", *maxConcurrentRestores, *maxConcurrentCheckpoints)
+	if *maxConcurrentImagePreps < 0 || *maxConcurrentRestores < 0 || *maxConcurrentCheckpoints < 0 {
+		return fmt.Errorf("--max-concurrent-image-preps %d, --max-concurrent-restores %d and --max-concurrent-checkpoints %d must be >= 0", *maxConcurrentImagePreps, *maxConcurrentRestores, *maxConcurrentCheckpoints)
 	}
 	if *snapshotUploadWorkers < 1 {
 		return fmt.Errorf("--snapshot-upload-workers %d must be >= 1", *snapshotUploadWorkers)
@@ -759,8 +760,12 @@ type Atelet struct {
 	workerDialer          *WorkerDialer
 	imageCache            *imagecache.Store
 	imagePluginClient     imagepluginclient.Client
-	// restoreSlots and checkpointSlots bound how many Restore and Checkpoint
-	// RPCs run at once on this node; nil means no bound.
+	// imagePrepSlots bounds how many cold image preparations run at once on
+	// this node, restoreSlots how many worker restores, checkpointSlots how
+	// many Checkpoint RPCs; nil means no bound. Cold starts and warm wakes
+	// have their own lanes so a fleet waking does not starve the few cold
+	// starts a node can afford.
+	imagePrepSlots  *semaphore.Weighted
 	restoreSlots    *semaphore.Weighted
 	checkpointSlots *semaphore.Weighted
 	imageKeychain         authn.Keychain
@@ -886,6 +891,7 @@ func NewService(
 	wms := &Atelet{
 		workerDialer:          workerDialer,
 		imageCache:            imageCache,
+		imagePrepSlots:        newSlots(*maxConcurrentImagePreps),
 		restoreSlots:          newSlots(*maxConcurrentRestores),
 		checkpointSlots:       newSlots(*maxConcurrentCheckpoints),
 		sandboxAssetCache:     sandboxAssetCache,
@@ -1794,11 +1800,6 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if errs := apivalidation.ValidateRestoreRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
-	releaseSlot, err := acquireSlot(ctx, s.restoreSlots, "Restore")
-	if err != nil {
-		return nil, err
-	}
-	defer releaseSlot()
 
 	actorUID := req.GetActorUid()
 	actor := actorRef{atespace: req.GetAtespace(), name: req.GetActorName(), uid: actorUID}
@@ -2060,6 +2061,10 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 
 	// The worker_restore phase is opaque from here; worker logs its own breakdown of
 	// this call as "Actor restore phases".
+	releaseRestoreSlot, err := acquireSlot(ctx, s.restoreSlots, "restore")
+	if err != nil {
+		return nil, err
+	}
 	tWorker := time.Now()
 	workerResp, err := client.RestoreWorkload(ctx, &ateworkerpb.RestoreWorkloadRequest{
 		Atespace:              actorRef.Atespace,
@@ -2077,6 +2082,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		Resources:             toAteworkerResources(req.GetResources()),
 	})
 	dWorker = time.Since(tWorker)
+	releaseRestoreSlot()
 	if err != nil {
 		return nil, s.boundRetryableRestoreError(actorUID, req.GetSnapshot().GetSnapshotUuid(), workerRestoreError(ctx, err))
 	}
@@ -2455,7 +2461,20 @@ func (s *Atelet) prepareOCIBundles(
 			envs = append(envs, fmt.Sprintf("%s=%s", env.GetName(), env.GetValue()))
 		}
 		g.Go(func() error {
+			// An image already on the node costs nothing to prepare; a cold
+			// one takes a slot in the image-prep lane.
+			releasePrepSlot := func() {}
+			if s.imageCache != nil && s.imagePrepSlots != nil {
+				if cached, err := s.imageCache.CachedImage(gCtx, ctr.GetImage()); err != nil || cached == nil {
+					release, err := acquireSlot(gCtx, s.imagePrepSlots, "image prep")
+					if err != nil {
+						return err
+					}
+					releasePrepSlot = release
+				}
+			}
 			img, cwd, err := prepareOCIDirectory(gCtx, s.imageCache, layerClient, s.imageKeychain, s.instruments, actorUID, ctr.GetName(), ctr.GetImage(), spec.GetVolumes(), ctr.GetVolumeMounts())
+			releasePrepSlot()
 			if err != nil {
 				return wrapFileSystemErr(fmt.Sprintf("while creating %q OCI bundle", ctr.GetName()), err)
 			}
