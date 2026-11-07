@@ -132,6 +132,12 @@ spec:
           done
 
           umount -l "${gcfsd_mnt_dir}" 2>/dev/null || true
+          # A provider killed without its cleanup (a forced pod delete, a
+          # node crash) leaves its snapshot view mounts behind, and the rm
+          # below cannot remove a mount point. Unmount them, deepest first.
+          awk -v root="${gcfs_root}/" 'index($2, root) == 1 {print $2}' /proc/self/mounts | sort -r | while read -r m; do
+            umount -l "${m}" 2>/dev/null || true
+          done
           # Keep the layer cache (snapshotter/layers) across restarts so the
           # node stays warm. Clear the view state: gcfsd restores its views
           # from images_in_use.db, but without containerd nothing keeps them
