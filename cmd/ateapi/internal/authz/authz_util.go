@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -177,6 +178,16 @@ func FormatMember(member string) (string, error) {
 //go:embed model.fga
 var modelDSL string
 
+const (
+	// checkCacheTTL bounds how long another api server serves a cached Check
+	// or tuple read after this one changed the tuples behind it.
+	checkCacheTTL = 10 * time.Second
+	// checkCacheLimit is the number of cached Check results and tuple reads
+	// per api server. Each actor operation leaves a handful, so the limit
+	// covers the actors an api server sees inside one TTL.
+	checkCacheLimit = 200_000
+)
+
 // NewOpenFGAServer creates an embedded OpenFGA server backed by a transaction-aware
 // PostgreSQL datastore on pool. Calling Close on the returned server stops
 // OpenFGA's background workers without closing the caller-owned pool.
@@ -188,8 +199,26 @@ func NewOpenFGAServer(pool *pgxpool.Pool) (*server.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating OpenFGA postgres adapter: %w", err)
 	}
+	cache, err := newCheckCache(checkCacheLimit)
+	if err != nil {
+		return nil, fmt.Errorf("creating OpenFGA check cache: %w", err)
+	}
 	fgaServer, err := server.NewServerWithOpts(
-		server.WithDatastore(newTransactionalDatastore(rawDatastore)),
+		server.WithDatastore(newTransactionalDatastore(rawDatastore, cache)),
+		// Every Control RPC runs a Check, and a Check reads its tuples from
+		// Postgres each time: about 170 tuple reads per actor operation at
+		// 36K actors. The caches answer a repeated Check, and a repeated
+		// tuple read under a Check, from memory for checkCacheTTL. The cache
+		// is ours so a tuple write through this server drops it at once; the
+		// cache controller drops entries behind a write made through another
+		// api server within its own TTL.
+		server.WithCheckCache(cache),
+		server.WithCheckQueryCacheEnabled(true),
+		server.WithCheckIteratorCacheEnabled(true),
+		server.WithCacheControllerEnabled(true),
+		server.WithCheckQueryCacheTTL(checkCacheTTL),
+		server.WithCheckIteratorCacheTTL(checkCacheTTL),
+		server.WithCacheControllerTTL(checkCacheTTL),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating OpenFGA server: %w", err)

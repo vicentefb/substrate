@@ -66,11 +66,13 @@ var ErrNoTransactionInContext = errors.New("authz datastore: active pgx.Tx requi
 // operations to participate in an existing external transaction passed via ContextWithTx.
 type transactionalDatastore struct {
 	*postgres.Datastore
+	cache *checkCache
 }
 
-// newTransactionalDatastore wraps ds with transaction-awareness.
-func newTransactionalDatastore(ds *postgres.Datastore) *transactionalDatastore {
-	return &transactionalDatastore{Datastore: ds}
+// newTransactionalDatastore wraps ds with transaction-awareness. cache is
+// dropped after every tuple write.
+func newTransactionalDatastore(ds *postgres.Datastore, cache *checkCache) *transactionalDatastore {
+	return &transactionalDatastore{Datastore: ds, cache: cache}
 }
 
 // Close is a no-op because the underlying *pgxpool.Pool is owned and closed by
@@ -254,6 +256,10 @@ func (d *transactionalDatastore) writeOnTx(
 	if err := executeInsertChanges(ctx, tx, changeLogItems); err != nil {
 		return err
 	}
+	// The write is not committed yet, so a Check between here and the commit
+	// can cache the state before it; checkCacheTTL bounds how long that
+	// entry lives, as it does for every other api server.
+	d.cache.Invalidate()
 	return nil
 }
 

@@ -403,7 +403,21 @@ func TestTransactionalDatastore_RollbackAndCommit(t *testing.T) {
 	if err := singleTx.Commit(txCtxTimeout); err != nil {
 		t.Fatalf("singleTx.Commit failed: %v", err)
 	}
-	if checkAllowed() {
+	// Checked through the server that wrote the delete: fgaSrv's cache may
+	// still hold the grant for checkCacheTTL.
+	resp, err := singleFGASrv.Check(ctx, &openfgav1.CheckRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: modelID,
+		TupleKey: &openfgav1.CheckRequestTupleKey{
+			User:     "user:bob",
+			Relation: "can_get",
+			Object:   "atespace:team-tx",
+		},
+	})
+	if err != nil {
+		t.Fatalf("singleFGASrv.Check failed: %v", err)
+	}
+	if resp.GetAllowed() {
 		t.Fatalf("expected bob denied after committed delete on single-connection pool")
 	}
 }

@@ -93,6 +93,10 @@ func (a *Authorizer) Check(ctx context.Context, relation, object string) error {
 // tuples, OpenFGA evaluates these as contextual tuples: object's structural
 // parent links, user's bootstrap owner grant if configured, and grants.
 func (a *Authorizer) checkRaw(ctx context.Context, user, relation, object string, grants ...*openfgav1.TupleKey) (bool, error) {
+	// A cached Check would answer a request whose context is already done.
+	if err := ctx.Err(); err != nil {
+		return false, apierror.Internal("authz: %v", err)
+	}
 	tuples := append(contextualTuples(object), grants...)
 	// A Check only evaluates the caller, so only the caller's own bootstrap
 	// grant can affect the result.
