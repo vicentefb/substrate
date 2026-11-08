@@ -19,11 +19,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 )
 
-// TestSaveWorker_RejectsAStaleWrite proves the precondition saveWorker states
+// TestSaveWorker_RejectsAStaleWrite proves the precondition queueSaveWorker states
 // on top of the row lock its callers hold: a Worker read before someone else
 // wrote it cannot overwrite that write.
 func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
@@ -62,7 +63,7 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 	if err := saveWorker(ctx, tx, created); !errors.Is(err, store.ErrVersionConflict) {
-		t.Errorf("saveWorker() with a stale Worker = %v, want ErrVersionConflict", err)
+		t.Errorf("queueSaveWorker() with a stale Worker = %v, want ErrVersionConflict", err)
 	}
 }
 
@@ -99,6 +100,16 @@ func TestSaveWorker_RejectsAVanishedWorker(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 	if err := saveWorker(ctx, tx, created); !errors.Is(err, store.ErrVersionConflict) {
-		t.Errorf("saveWorker() on a deleted Worker = %v, want ErrVersionConflict", err)
+		t.Errorf("queueSaveWorker() on a deleted Worker = %v, want ErrVersionConflict", err)
 	}
+}
+
+// saveWorker queues the Worker's write and sends it on tx, as the batched
+// paths do at the end of their transaction.
+func saveWorker(ctx context.Context, tx pgx.Tx, worker *ateapi.Worker) error {
+	var w writes
+	if err := queueSaveWorker(&w, worker); err != nil {
+		return err
+	}
+	return w.send(ctx, tx)
 }
