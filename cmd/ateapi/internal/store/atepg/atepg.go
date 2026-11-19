@@ -80,6 +80,9 @@ type Persistence struct {
 	// watchMu guards watchers, the live WatchWorkers channels.
 	watchMu  sync.Mutex
 	watchers map[chan store.WorkerEvent]struct{}
+	// atespaceMu guards atespaceCache, a short-TTL read cache for GetAtespace.
+	atespaceMu    sync.RWMutex
+	atespaceCache map[string]cachedAtespace
 }
 
 // addWatcher enrolls a WatchWorkers channel to receive locally published events.

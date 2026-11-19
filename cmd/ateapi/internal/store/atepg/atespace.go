@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"go.ate.dev/substrate/api/ateapi/v1"
@@ -25,6 +26,30 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+const atespaceCacheTTL = 5 * time.Second
+
+type cachedAtespace struct {
+	atespace  *ateapi.Atespace
+	expiresAt time.Time
+}
+
+func (p *Persistence) putCachedAtespace(name string, a *ateapi.Atespace) {
+	cloned := proto.Clone(a).(*ateapi.Atespace)
+	exp := time.Now().Add(atespaceCacheTTL)
+	p.atespaceMu.Lock()
+	if p.atespaceCache == nil {
+		p.atespaceCache = make(map[string]cachedAtespace)
+	}
+	p.atespaceCache[name] = cachedAtespace{atespace: cloned, expiresAt: exp}
+	p.atespaceMu.Unlock()
+}
+
+func (p *Persistence) invalidateCachedAtespace(name string) {
+	p.atespaceMu.Lock()
+	delete(p.atespaceCache, name)
+	p.atespaceMu.Unlock()
+}
 
 func (p *Persistence) CreateAtespace(ctx context.Context, atespace *ateapi.Atespace) (*ateapi.Atespace, error) {
 	name := atespace.GetMetadata().GetName()
@@ -47,14 +72,27 @@ func (p *Persistence) CreateAtespace(ctx context.Context, atespace *ateapi.Atesp
 		}
 		return nil, fmt.Errorf("inserting atespace %q: %w", name, err)
 	}
+	p.putCachedAtespace(name, dbAtespace)
 	return dbAtespace, nil
 }
 
 func (p *Persistence) GetAtespace(ctx context.Context, name string) (*ateapi.Atespace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	p.atespaceMu.RLock()
+	entry, ok := p.atespaceCache[name]
+	p.atespaceMu.RUnlock()
+	if ok && now.Before(entry.expiresAt) {
+		return proto.Clone(entry.atespace).(*ateapi.Atespace), nil
+	}
+
 	var protoBytes []byte
 	err := p.pool.QueryRow(ctx, `SELECT proto FROM atespaces WHERE name = $1`, name).Scan(&protoBytes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			p.invalidateCachedAtespace(name)
 			return nil, store.ErrNotFound
 		}
 		return nil, fmt.Errorf("getting atespace %q: %w", name, err)
@@ -63,6 +101,7 @@ func (p *Persistence) GetAtespace(ctx context.Context, name string) (*ateapi.Ate
 	if err := unmarshalStored(protoBytes, out); err != nil {
 		return nil, fmt.Errorf("unmarshaling atespace: %w", err)
 	}
+	p.putCachedAtespace(name, out)
 	return out, nil
 }
 
@@ -150,6 +189,7 @@ func (p *Persistence) DeleteAtespace(ctx context.Context, name string, precondit
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing atespace delete %q: %w", name, err)
 	}
+	p.invalidateCachedAtespace(name)
 	out := &ateapi.Atespace{}
 	if err := unmarshalStored(protoBytes, out); err != nil {
 		return nil, fmt.Errorf("unmarshaling deleted atespace: %w", err)
