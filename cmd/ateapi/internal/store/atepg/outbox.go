@@ -187,18 +187,21 @@ const (
 	outboxPollInterval = 200 * time.Millisecond
 
 	// Cap rows fetched per poll; a burst beyond it carries over to the next poll
-	// (events are delayed, never dropped).
-	outboxBatch = 8192
+	// (events are delayed, never dropped). Keep <= 1024 so even without forced
+	// index GUC settings, PostgreSQL costs index-ordered Merge Append + LIMIT
+	// well below top-N Sort + Append across partitions.
+	outboxBatch = 1024
 
 	// Minimum time retention keeps outbox rows.
-	outboxRetentionAge = 15 * time.Minute
+	outboxRetentionAge = 30 * time.Minute
 
 	// The outbox partition range width.
 	outboxPartitionInterval = 15 * time.Minute
 
-	// How many intervals ahead partitions are pre-created: creation must stall past
-	// lead-1 intervals before any write detours into the DEFAULT partition backstop.
-	outboxPartitionLead = 2
+	// How many intervals ahead partitions are pre-created (8 * 15m = 2h ahead):
+	// prevents mid-benchmark partition-attach ACCESS EXCLUSIVE locks and
+	// relcache plan invalidations across multi-step 1M runs.
+	outboxPartitionLead = 8
 )
 
 // Bounds stale-serving during polling outages: after this duration of
@@ -222,11 +225,13 @@ const outboxMaintenanceLockKey = "atepg-outbox-maintenance"
 
 // pollWorkerOutboxSQL is the watch's batch query. The xid::text cast MUST
 // carry an alias so that ORDER BY xid sorts numerically by the table's xid8
-// column instead of alphabetically by the string output.
+// column instead of alphabetically by the string output. Wrapping
+// pg_snapshot_xmin(pg_current_snapshot()) in a scalar subquery forces an
+// InitPlan evaluated once per poll rather than per row if a fallback scan ever runs.
 const pollWorkerOutboxSQL = `
 	SELECT xid::text AS xid_text, payload FROM worker_outbox
 	WHERE xid > $1::xid8
-	  AND xid < pg_snapshot_xmin(pg_current_snapshot())
+	  AND xid < (SELECT pg_snapshot_xmin(pg_current_snapshot()))
 	ORDER BY xid LIMIT $2`
 
 // pollSafetySQL returns cheap safety scalars fetched on every poll:
@@ -317,6 +322,11 @@ func (p *Persistence) dropExpiredOutboxRetention(ctx context.Context, now time.T
 	if !elected {
 		return nil // another replica is maintaining; next tick retries
 	}
+	// Bound ACCESS EXCLUSIVE lock wait so retention DDL can never queue a
+	// multi-minute lock convoy ahead of concurrent INSERT INTO worker_outbox writers.
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
+		return fmt.Errorf("setting retention lock_timeout: %w", err)
+	}
 	// Drops run last in the pass with commit immediately after, keeping the
 	// writer-blocking window minimal.
 	if err := p.dropExpiredWorkerOutboxPartitions(ctx, tx, now); err != nil {
@@ -343,18 +353,69 @@ func outboxPartitionLeadTimes(now time.Time) []time.Time {
 	return times
 }
 
+// filterMissingOutboxPartitions returns only those instants whose partition is
+// not yet attached to worker_outbox in pg_inherits, avoiding redundant
+// CREATE TABLE ... PARTITION OF worker_outbox DDL (which acquires ACCESS
+// EXCLUSIVE on worker_outbox and invalidates prepared plans across replicas).
+func (p *Persistence) filterMissingOutboxPartitions(ctx context.Context, instants ...time.Time) ([]time.Time, error) {
+	rows, err := p.ownerPool.Query(ctx, `
+		SELECT child.relname FROM pg_inherits i
+		JOIN pg_class child ON child.oid = i.inhrelid
+		JOIN pg_class parent ON parent.oid = i.inhparent
+		WHERE i.inhparent = 'worker_outbox'::regclass
+		AND child.relnamespace = parent.relnamespace`)
+	if err != nil {
+		return nil, fmt.Errorf("listing existing outbox partitions: %w", err)
+	}
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scanning existing outbox partition: %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing existing outbox partitions: %w", err)
+	}
+	var missing []time.Time
+	seen := make(map[string]struct{}, len(instants))
+	for _, at := range instants {
+		start := at.UTC().Truncate(outboxPartitionInterval)
+		name := workerOutboxPartitionName(start)
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		missing = append(missing, start)
+	}
+	return missing, nil
+}
+
 // createWorkerOutboxPartitions idempotently creates partitions.
 // If writes spilled into DEFAULT, CREATE PARTITION fails (23514). We catch
 // this, TRUNCATE the strays (triggering watcher resyncs), and run CREATE
 // PARTITION inside the SAME transaction to safely un-wedge the system.
 func (p *Persistence) createWorkerOutboxPartitions(ctx context.Context, instants ...time.Time) error {
-	err := p.tryCreateWorkerOutboxPartitions(ctx, false, instants...)
+	missing, err := p.filterMissingOutboxPartitions(ctx, instants...)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	err = p.tryCreateWorkerOutboxPartitions(ctx, false, missing...)
 	if err == nil || !isCheckViolation(err) {
 		return err
 	}
 	slog.WarnContext(ctx, "outbox DEFAULT partition holds rows in a range being created; truncating strays to un-wedge partition creation",
 		slog.Any("err", err))
-	return p.tryCreateWorkerOutboxPartitions(ctx, true, instants...)
+	return p.tryCreateWorkerOutboxPartitions(ctx, true, missing...)
 }
 
 // isCheckViolation matches SQLSTATE 23514, which CREATE ... PARTITION OF
@@ -368,8 +429,50 @@ func (p *Persistence) tryCreateWorkerOutboxPartitions(ctx context.Context, trunc
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
+	if !truncateStrays {
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
+			return fmt.Errorf("setting partition lock_timeout: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('agent-substrate-atepg-outbox-partitions'))`); err != nil {
 		return fmt.Errorf("locking outbox partition DDL: %w", err)
+	}
+	// Re-check inside the advisory lock so the 59 losing replicas that raced a
+	// boundary tick skip issuing redundant CREATE ... PARTITION OF DDL.
+	if !truncateStrays {
+		rows, err := tx.Query(ctx, `
+			SELECT child.relname FROM pg_inherits i
+			JOIN pg_class child ON child.oid = i.inhrelid
+			JOIN pg_class parent ON parent.oid = i.inhparent
+			WHERE i.inhparent = 'worker_outbox'::regclass
+			AND child.relnamespace = parent.relnamespace`)
+		if err != nil {
+			return fmt.Errorf("rechecking outbox partitions: %w", err)
+		}
+		existing := make(map[string]struct{})
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return fmt.Errorf("scanning outbox partition: %w", err)
+			}
+			existing[name] = struct{}{}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("rechecking outbox partitions: %w", err)
+		}
+		var stillMissing []time.Time
+		for _, at := range instants {
+			start := at.UTC().Truncate(outboxPartitionInterval)
+			if _, ok := existing[workerOutboxPartitionName(start)]; !ok {
+				stillMissing = append(stillMissing, start)
+			}
+		}
+		if len(stillMissing) == 0 {
+			return tx.Commit(ctx)
+		}
+		instants = stillMissing
 	}
 	if truncateStrays {
 		// Parent BEFORE child: Writers lock parent-then-child, so locking DEFAULT
