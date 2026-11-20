@@ -17,12 +17,31 @@ package authz
 import (
 	"context"
 	"strings"
+	"sync"
+	"time"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"github.com/openfga/openfga/pkg/server"
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/principal"
 )
+
+const (
+	maxScopeCacheEntries = 4096
+	scopeProbeSuffix     = "__ate_scope_probe__"
+)
+
+type scopeCheckKey struct {
+	kind     string
+	user     string
+	relation string
+	scopeObj string
+}
+
+type scopeCheckEntry struct {
+	generation uint64
+	expiresAt  time.Time
+}
 
 // Authorizer is the read-only policy decision point that evaluates runtime
 // OpenFGA permissions against Substrate's store and authorization model.
@@ -49,6 +68,59 @@ type Authorizer struct {
 	// tuple can't match a JWT subject, and AccessPolicy reconciliation
 	// limited to its own relations, so it doesn't delete them.
 	systemPrincipals map[string][]string
+
+	cache        *checkCache
+	scopeMu      sync.RWMutex
+	scopeAllowed map[scopeCheckKey]scopeCheckEntry
+}
+
+func (a *Authorizer) cacheGen() uint64 {
+	if a.cache == nil {
+		return 0
+	}
+	return a.cache.generation.Load()
+}
+
+func scopeCanonicalObject(relation, object string) (scopeObj string, exact bool) {
+	if relation == "can_mint_worker_actor_credential" {
+		return "", false
+	}
+	objectType, id, ok := strings.Cut(object, ":")
+	if !ok || id == "" {
+		return "", false
+	}
+	switch objectType {
+	case "global", "atespace":
+		return object, true
+	case "worker":
+		if id == scopeProbeSuffix {
+			return "", false
+		}
+		return "worker:" + scopeProbeSuffix, false
+	case "actor", "actor_template", "tag":
+		atespace, name, hasSep := strings.Cut(id, "/")
+		if !hasSep || atespace == "" || name == "" || name == scopeProbeSuffix {
+			return "", false
+		}
+		return objectType + ":" + atespace + "/" + scopeProbeSuffix, false
+	}
+	return "", false
+}
+
+func (a *Authorizer) getScopeAllowed(key scopeCheckKey, gen uint64, now time.Time) bool {
+	a.scopeMu.RLock()
+	entry, ok := a.scopeAllowed[key]
+	a.scopeMu.RUnlock()
+	return ok && entry.generation == gen && now.Before(entry.expiresAt)
+}
+
+func (a *Authorizer) putScopeAllowed(key scopeCheckKey, gen uint64, now time.Time) {
+	a.scopeMu.Lock()
+	if a.scopeAllowed == nil || len(a.scopeAllowed) >= maxScopeCacheEntries {
+		a.scopeAllowed = make(map[scopeCheckKey]scopeCheckEntry, 64)
+	}
+	a.scopeAllowed[key] = scopeCheckEntry{generation: gen, expiresAt: now.Add(checkCacheTTL)}
+	a.scopeMu.Unlock()
 }
 
 // Check verifies that the principal in ctx has relation on object.
@@ -64,11 +136,26 @@ func (a *Authorizer) Check(ctx context.Context, relation, object string) error {
 	if a == nil || a.fgaServer == nil {
 		return apierror.Internal("authz: authorizer is not initialized")
 	}
+	if err := ctx.Err(); err != nil {
+		return apierror.Internal("authz: %v", err)
+	}
 	p, ok := principal.FromContext(ctx)
 	if !ok || p.ID == "" {
 		return apierror.Unauthenticated("unauthenticated: missing principal in context")
 	}
 	user := formatUser(p.ID)
+
+	scopeObj, exact := scopeCanonicalObject(relation, object)
+	now := time.Now()
+	gen := a.cacheGen()
+	var sKey scopeCheckKey
+	if scopeObj != "" {
+		sKey = scopeCheckKey{kind: p.Kind, user: user, relation: relation, scopeObj: scopeObj}
+		if a.getScopeAllowed(sKey, gen, now) {
+			return nil
+		}
+	}
+
 	var grants []*openfgav1.TupleKey
 	if p.Kind == principal.KindMTLS {
 		for _, role := range a.systemPrincipals[user] {
@@ -79,12 +166,23 @@ func (a *Authorizer) Check(ctx context.Context, relation, object string) error {
 			})
 		}
 	}
+
+	if scopeObj != "" && !exact {
+		if scopeOK, err := a.checkRaw(ctx, user, relation, scopeObj, grants...); err == nil && scopeOK {
+			a.putScopeAllowed(sKey, gen, time.Now())
+			return nil
+		}
+	}
+
 	allowed, err := a.checkRaw(ctx, user, relation, object, grants...)
 	if err != nil {
 		return err
 	}
 	if !allowed {
 		return apierror.PermissionDenied("permission denied: principal %q lacks %q on %q", user, relation, object)
+	}
+	if scopeObj != "" && exact {
+		a.putScopeAllowed(sKey, gen, time.Now())
 	}
 	return nil
 }

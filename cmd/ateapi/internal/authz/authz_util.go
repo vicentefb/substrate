@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -182,48 +183,50 @@ const (
 	// checkCacheTTL bounds how long another api server serves a cached Check
 	// or tuple read after this one changed the tuples behind it.
 	checkCacheTTL = 10 * time.Second
-	// checkCacheLimit is the number of cached Check results and tuple reads
-	// per api server. Each actor operation leaves a handful, so the limit
-	// covers the actors an api server sees inside one TTL.
-	checkCacheLimit = 200_000
+	// checkCacheLimit bounds OpenFGA's iterator cache (stored tuples live only on
+	// global:root and atespace:<name>; per-actor Check Query caching is disabled
+	// because 1M+ unique actor names + contextual tuples churn multi-GB heaps).
+	checkCacheLimit = 16_384
 )
+
+var serverCaches sync.Map // *server.Server -> *checkCache
 
 // NewOpenFGAServer creates an embedded OpenFGA server backed by a transaction-aware
 // PostgreSQL datastore on pool. Calling Close on the returned server stops
 // OpenFGA's background workers without closing the caller-owned pool.
 func NewOpenFGAServer(pool *pgxpool.Pool) (*server.Server, error) {
+	p, c, err := newOpenFGAServerWithCache(pool)
+	if err == nil && p != nil && c != nil {
+		serverCaches.Store(p, c)
+	}
+	return p, err
+}
+
+func newOpenFGAServerWithCache(pool *pgxpool.Pool) (*server.Server, *checkCache, error) {
 	if pool == nil {
-		return nil, fmt.Errorf("postgres pool must not be nil")
+		return nil, nil, fmt.Errorf("postgres pool must not be nil")
 	}
 	rawDatastore, err := postgres.NewWithDB(pool, nil, sqlcommon.NewConfig())
 	if err != nil {
-		return nil, fmt.Errorf("creating OpenFGA postgres adapter: %w", err)
+		return nil, nil, fmt.Errorf("creating OpenFGA postgres adapter: %w", err)
 	}
 	cache, err := newCheckCache(checkCacheLimit)
 	if err != nil {
-		return nil, fmt.Errorf("creating OpenFGA check cache: %w", err)
+		return nil, nil, fmt.Errorf("creating OpenFGA check cache: %w", err)
 	}
 	fgaServer, err := server.NewServerWithOpts(
 		server.WithDatastore(newTransactionalDatastore(rawDatastore, cache)),
-		// Every Control RPC runs a Check, and a Check reads its tuples from
-		// Postgres each time: about 170 tuple reads per actor operation at
-		// 36K actors. The caches answer a repeated Check, and a repeated
-		// tuple read under a Check, from memory for checkCacheTTL. The cache
-		// is ours so a tuple write through this server drops it at once; the
-		// cache controller drops entries behind a write made through another
-		// api server within its own TTL.
 		server.WithCheckCache(cache),
-		server.WithCheckQueryCacheEnabled(true),
+		server.WithCheckQueryCacheEnabled(false),
 		server.WithCheckIteratorCacheEnabled(true),
 		server.WithCacheControllerEnabled(true),
-		server.WithCheckQueryCacheTTL(checkCacheTTL),
 		server.WithCheckIteratorCacheTTL(checkCacheTTL),
 		server.WithCacheControllerTTL(checkCacheTTL),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("creating OpenFGA server: %w", err)
+		return nil, nil, fmt.Errorf("creating OpenFGA server: %w", err)
 	}
-	return fgaServer, nil
+	return fgaServer, cache, nil
 }
 
 // EnsureStoreAndModel ensures the default OpenFGA store and checked-in authorization model
@@ -285,12 +288,17 @@ func New(ctx context.Context, pool *pgxpool.Pool, fgaServer *server.Server, boot
 	if err != nil {
 		return nil, nil, err
 	}
+	var cache *checkCache
+	if c, ok := serverCaches.Load(fgaServer); ok {
+		cache, _ = c.(*checkCache)
+	}
 	authorizer := &Authorizer{
 		fgaServer:        fgaServer,
 		storeID:          storeID,
 		modelID:          modelID,
 		bootstrapOwners:  owners,
 		systemPrincipals: systemPrincipals,
+		cache:            cache,
 	}
 	policyManager := &PolicyManager{
 		fgaServer: fgaServer,
